@@ -21,6 +21,8 @@ setup(
       "tqdm",
       "seaborn",
       "wandb",
-      "GeoGen @ git+https://github.com/eldadHaber/StructuralGeo.git@v1.0"
+      "GeoGen @ git+https://github.com/eldadHaber/StructuralGeo.git@v1.0",
+      "SimPEG",
+      "discretize",
   ],
 )
