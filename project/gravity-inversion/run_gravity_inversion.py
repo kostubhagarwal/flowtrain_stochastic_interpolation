@@ -4,31 +4,154 @@ Posterior flow sampling for gravity inversion.
 Uses a pre-trained unconditional flow-matching model as the prior and guides
 the ODE integration with a gravity data-fidelity gradient so that generated
 geological models are consistent with observed gravity measurements.
+
+This script is self-contained — it reconstructs the model directly from a
+Lightning checkpoint without importing the training-only modules that depend
+on geogen.
 """
 
 import argparse
 import os
-import sys
 import time
-import warnings
+import urllib.request
 
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-# ---------------------------------------------------------------------------
-# Allow imports from the sibling unconditional project (model loading, utils)
-# ---------------------------------------------------------------------------
+from flowtrain.models import Unet3D
+from flowtrain.solvers import ODEFlowSolver
+
+from density_mapping import DifferentiableDensityMapper, DENSITY_TABLE_15
+from gravity_forward import GravityForward
+from posterior_flow_solver import PosteriorFlowSolver, GuidanceSchedule
+
+
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-_UNCOND_DIR = os.path.join(_SCRIPT_DIR, "..", "geodata-3d-unconditional")
-sys.path.insert(0, _UNCOND_DIR)
 
-from model_train_inference import Geo3DStochInterp  # noqa: E402
-from utils import download_if_missing, plot_static_views, plot_cat_view  # noqa: E402
 
-# Local modules
-from density_mapping import DifferentiableDensityMapper, DENSITY_TABLE_15  # noqa: E402
-from gravity_forward import GravityForward  # noqa: E402
-from posterior_flow_solver import PosteriorFlowSolver, GuidanceSchedule  # noqa: E402
+# ======================================================================
+# Lightweight model wrapper (avoids importing geogen)
+# ======================================================================
+
+class FlowModel(nn.Module):
+    """Minimal wrapper holding the Unet3D velocity network and embedding layer.
+
+    Provides the same ``.net``, ``.embedding``, ``.embedding_dim``,
+    ``.decode()`` interface as ``Geo3DStochInterp`` but without any
+    training / Lightning / geogen dependencies.
+    """
+
+    def __init__(self, net: Unet3D, embedding: nn.Embedding):
+        super().__init__()
+        self.net = net
+        self.embedding = embedding
+        self.embedding_dim = embedding.embedding_dim
+        self.num_categories = embedding.num_embeddings
+
+    # ---- decode (same logic as Geo3DStochInterp.decode) ----
+    def decode(self, x: torch.Tensor) -> torch.Tensor:
+        """Decode embedding-space tensor to categorical indices.
+
+        Parameters
+        ----------
+        x : torch.Tensor  ``(B, E, X, Y, Z)``
+
+        Returns
+        -------
+        torch.Tensor  ``(B, X, Y, Z)``  integer category indices.
+        """
+        emb = self.embedding.weight  # (K, E)
+        B, E, X, Y, Z = x.shape
+
+        x_norm = F.normalize(x, dim=1)
+        emb_norm = F.normalize(emb, dim=1)
+
+        x_exp = x_norm.unsqueeze(1)  # (B, 1, E, X, Y, Z)
+        emb_exp = emb_norm.view(1, self.num_categories, E, 1, 1, 1)
+
+        logits = (x_exp * emb_exp).sum(dim=2)  # (B, K, X, Y, Z)
+        return torch.argmax(logits, dim=1)  # (B, X, Y, Z)
+
+
+def _download_if_missing(path: str, url: str) -> None:
+    if not os.path.exists(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        print(f"Downloading weights from {url} ...")
+        urllib.request.urlretrieve(url, path)
+        print("Download complete.")
+
+
+def _init_simplex_embedding(n_cats: int, n_dims: int) -> torch.Tensor:
+    """Build the same centred-simplex embedding used during training."""
+    init = torch.zeros(n_cats, n_dims)
+    init[:, :n_cats] = torch.eye(n_cats)
+    centroid = torch.ones(n_cats) / n_cats
+    centroid = torch.cat([centroid, torch.zeros(n_dims - n_cats)])
+    init[:, :n_cats] -= centroid[:n_cats].unsqueeze(0)
+    init = init / init.norm(dim=1, keepdim=True)
+    return init
+
+
+def load_pretrained_model(config: dict) -> FlowModel:
+    """Reconstruct the inference model directly from a Lightning checkpoint."""
+    device = config["model"]["device"]
+    ckpt_path = config["model"]["checkpoint_path"]
+
+    if ckpt_path is None:
+        ckpt_path = os.path.join(
+            _SCRIPT_DIR, "..", "geodata-3d-unconditional",
+            "demo_model", "unconditional-weights.ckpt",
+        )
+        url = (
+            "https://github.com/chipnbits/flowtrain_stochastic_interpolation"
+            "/releases/download/v1.0.0/unconditional-weights.ckpt"
+        )
+        _download_if_missing(ckpt_path, url)
+
+    print(f"Loading model from: {ckpt_path}")
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+
+    hp = ckpt["hyper_parameters"]
+    num_categories = hp.get("num_categories", 15)
+    embedding_dim = hp.get("embedding_dim", 20)
+
+    # Build Unet3D from the saved model_params
+    model_params = {k: v for k, v in hp.items()
+                    if k not in ("data_shape", "time_range", "num_categories",
+                                 "embedding_dim", "lambda_angle",
+                                 "learning_rate", "lr_decay")}
+    model_params["data_channels"] = embedding_dim
+    net = Unet3D(**model_params)
+
+    # Build embedding
+    embedding = nn.Embedding(num_categories, embedding_dim)
+    embedding.weight.data.copy_(_init_simplex_embedding(num_categories, embedding_dim))
+    embedding.weight.requires_grad = False
+
+    # Load weights from state_dict
+    sd = ckpt["state_dict"]
+    net_sd = {k.replace("net.", "", 1): v for k, v in sd.items() if k.startswith("net.")}
+    emb_sd = {k.replace("embedding.", "", 1): v for k, v in sd.items() if k.startswith("embedding.")}
+
+    net.load_state_dict(net_sd)
+    embedding.load_state_dict(emb_sd)
+
+    model = FlowModel(net, embedding)
+
+    # Load EMA weights if available
+    ema_shadow = ckpt.get("ema_shadow", {})
+    if ema_shadow:
+        print("  Applying EMA weights ...")
+        for name, param in model.net.named_parameters():
+            full_key = f"net.{name}"
+            if full_key in ema_shadow:
+                param.data.copy_(ema_shadow[full_key])
+
+    model.to(device)
+    model.eval()
+    return model
 
 
 # ======================================================================
@@ -38,7 +161,7 @@ from posterior_flow_solver import PosteriorFlowSolver, GuidanceSchedule  # noqa:
 def get_config() -> dict:
     return {
         "model": {
-            "checkpoint_path": None,  # filled by CLI or default demo weights
+            "checkpoint_path": None,
             "device": "cuda" if torch.cuda.is_available() else "cpu",
         },
         "domain": {
@@ -66,36 +189,8 @@ def get_config() -> dict:
         "output": {
             "save_dir": os.path.join(_SCRIPT_DIR, "results"),
             "save_trajectory": False,
-            "save_images": True,
         },
     }
-
-
-# ======================================================================
-# Model loading
-# ======================================================================
-
-def load_pretrained_model(config: dict) -> Geo3DStochInterp:
-    """Load the unconditional flow model from checkpoint."""
-    device = config["model"]["device"]
-    ckpt = config["model"]["checkpoint_path"]
-
-    if ckpt is None:
-        # Fall back to the demo weights shipped with the unconditional project
-        ckpt = os.path.join(
-            _UNCOND_DIR, "demo_model", "unconditional-weights.ckpt"
-        )
-        url = (
-            "https://github.com/chipnbits/flowtrain_stochastic_interpolation"
-            "/releases/download/v1.0.0/unconditional-weights.ckpt"
-        )
-        download_if_missing(ckpt, url)
-
-    print(f"Loading model from: {ckpt}")
-    model = Geo3DStochInterp.load_from_checkpoint(ckpt, map_location=device)
-    model.to(device)
-    model.eval()
-    return model
 
 
 # ======================================================================
@@ -103,60 +198,41 @@ def load_pretrained_model(config: dict) -> Geo3DStochInterp:
 # ======================================================================
 
 def create_synthetic_problem(
-    model: Geo3DStochInterp,
+    model: FlowModel,
     gravity_fwd: GravityForward,
-    density_mapper: DifferentiableDensityMapper,
     config: dict,
 ) -> tuple:
     """Generate a synthetic gravity inverse problem.
 
     1. Draw one unconditional sample from the flow model.
-    2. Decode to categorical indices → density.
-    3. Compute gravity response + noise → d_obs.
-
-    Returns
-    -------
-    true_categorical : torch.Tensor
-        ``(X, Y, Z)`` categorical indices of the true model.
-    true_density_np : np.ndarray
-        ``(n_cells,)`` flattened density (Fortran order for SimPEG).
-    d_obs : np.ndarray
-        ``(n_data,)`` synthetic observed gravity data.
+    2. Decode to categorical indices -> density.
+    3. Compute gravity response + noise -> d_obs.
     """
     device = config["model"]["device"]
     shape = config["domain"]["shape"]
 
     print("Generating true model via unconditional sampling ...")
-    from flowtrain.solvers import ODEFlowSolver
-
     solver = ODEFlowSolver(model=model.net, rtol=1e-6)
     X0 = torch.randn(1, model.embedding_dim, *shape, device=device)
     solution = solver.solve(X0, t0=0.001, tf=1.0, n_steps=32)
     X_final = solution[-1]  # (1, E, X, Y, Z)
 
-    # Decode to categorical
     true_categorical = model.decode(X_final)[0].cpu()  # (X, Y, Z)
 
-    # Map to density via the hard decode (argmax) path for a clean true model
-    emb_weights = model.embedding.weight  # (K, E)
-    n_cats = emb_weights.shape[0]
+    n_cats = model.num_categories
     density_lut = torch.tensor(DENSITY_TABLE_15[:n_cats], dtype=torch.float32)
     true_density_vol = density_lut[true_categorical.long()]  # (X, Y, Z)
     true_density_np = true_density_vol.numpy().flatten(order="F")
 
-    # Generate observed gravity data with noise
     d_obs = gravity_fwd.generate_synthetic_data(
         true_density_np,
         noise_percent=config["gravity"]["noise_percent"],
         seed=config["inversion"]["seed"],
     )
 
-    print(
-        f"  True model categories: {int(true_categorical.min())} – {int(true_categorical.max())}"
-    )
-    print(f"  Density range: {true_density_np.min():.2f} – {true_density_np.max():.2f} g/cm³")
-    print(f"  Gravity data: {d_obs.shape[0]} observations")
-    print(f"  Gravity range: {d_obs.min():.4f} – {d_obs.max():.4f}")
+    print(f"  Categories: {int(true_categorical.min())} – {int(true_categorical.max())}")
+    print(f"  Density: {true_density_np.min():.2f} – {true_density_np.max():.2f} g/cm³")
+    print(f"  Gravity: {d_obs.shape[0]} obs, range {d_obs.min():.4f} – {d_obs.max():.4f}")
 
     return true_categorical, true_density_np, d_obs
 
@@ -166,18 +242,12 @@ def create_synthetic_problem(
 # ======================================================================
 
 def run_posterior_sampling(
-    model: Geo3DStochInterp,
+    model: FlowModel,
     gravity_fwd: GravityForward,
     d_obs: np.ndarray,
     config: dict,
 ) -> list:
-    """Generate posterior samples conditioned on observed gravity data.
-
-    Returns
-    -------
-    list[torch.Tensor]
-        Decoded categorical models ``(X, Y, Z)`` per sample.
-    """
+    """Generate posterior samples conditioned on observed gravity data."""
     device = config["model"]["device"]
     inv = config["inversion"]
     shape = config["domain"]["shape"]
@@ -220,13 +290,12 @@ def run_posterior_sampling(
         )
         elapsed = time.time() - t_start
 
-        # Take final state
         if config["output"]["save_trajectory"]:
             final_state = m_final[-1].to(device)
         else:
             final_state = m_final
 
-        decoded = model.decode(final_state)[0].detach().cpu()  # (X, Y, Z)
+        decoded = model.decode(final_state)[0].detach().cpu()
         results.append(decoded)
         print(f"  Completed in {elapsed:.1f}s")
 
@@ -242,30 +311,15 @@ def save_results(
     true_categorical: torch.Tensor,
     d_obs: np.ndarray,
     save_dir: str,
-    save_images: bool = True,
 ):
     """Persist posterior samples, the true model, and observed data."""
     os.makedirs(save_dir, exist_ok=True)
 
-    # Save observed data
     np.save(os.path.join(save_dir, "d_obs.npy"), d_obs)
-
-    # Save true model
     torch.save(true_categorical, os.path.join(save_dir, "true_model.pt"))
-    if save_images:
-        try:
-            plot_cat_view(true_categorical, save_path=os.path.join(save_dir, "true_model_cat.png"))
-        except Exception as e:
-            warnings.warn(f"Failed to save true model image: {e}")
 
-    # Save posterior samples
     for i, sample in enumerate(posterior_samples):
         torch.save(sample, os.path.join(save_dir, f"posterior_sample_{i}.pt"))
-        if save_images:
-            try:
-                plot_cat_view(sample, save_path=os.path.join(save_dir, f"posterior_sample_{i}_cat.png"))
-            except Exception as e:
-                warnings.warn(f"Failed to save posterior sample {i} image: {e}")
 
     print(f"\nResults saved to {save_dir}")
 
@@ -307,8 +361,6 @@ def parse_arguments():
                         help="Random seed")
     parser.add_argument("--save-trajectory", action="store_true",
                         help="Save full ODE trajectory (large!)")
-    parser.add_argument("--no-images", action="store_true",
-                        help="Skip saving visualization images")
     return parser.parse_args()
 
 
@@ -320,7 +372,6 @@ def main():
     args = parse_arguments()
     config = get_config()
 
-    # Override from CLI
     if args.checkpoint:
         config["model"]["checkpoint_path"] = args.checkpoint
     if args.device:
@@ -336,7 +387,6 @@ def main():
     config["inversion"]["seed"] = args.seed
     config["gravity"]["noise_percent"] = args.noise_percent
     config["output"]["save_trajectory"] = args.save_trajectory
-    config["output"]["save_images"] = not args.no_images
 
     # 1. Load model
     model = load_pretrained_model(config)
@@ -353,28 +403,15 @@ def main():
     print(f"  Receivers : {gravity_fwd.survey.nD}")
 
     # 3. Create synthetic problem
-    device = config["model"]["device"]
-    density_mapper = DifferentiableDensityMapper(
-        embedding_weights=model.embedding.weight.clone(),
-        density_values=DENSITY_TABLE_15,
-        temperature=config["inversion"]["temperature"],
-    ).to(device)
-
     true_cat, true_density, d_obs = create_synthetic_problem(
-        model, gravity_fwd, density_mapper, config
+        model, gravity_fwd, config
     )
 
     # 4. Run posterior sampling
     posterior_samples = run_posterior_sampling(model, gravity_fwd, d_obs, config)
 
     # 5. Save everything
-    save_results(
-        posterior_samples,
-        true_cat,
-        d_obs,
-        config["output"]["save_dir"],
-        save_images=config["output"]["save_images"],
-    )
+    save_results(posterior_samples, true_cat, d_obs, config["output"]["save_dir"])
 
 
 if __name__ == "__main__":
