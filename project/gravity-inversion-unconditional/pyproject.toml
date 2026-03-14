@@ -1,0 +1,13 @@
+[project]
+name = "gravity-inversion"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "einops>=0.8.2",
+    "lightning>=2.6.1",
+    "numpy>=2.4.3",
+    "seaborn>=0.13.2",
+    "wandb>=0.25.1",
+]

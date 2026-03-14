@@ -110,9 +110,11 @@ class PosteriorFlowSolver:
         method: str = "euler",
         grad_clip: Optional[float] = None,
         normalize_grad: bool = False,
+        device: Optional[Union[str, torch.device]] = None,
     ):
-        self.net = net
-        self.density_mapper = density_mapper
+        self.device = torch.device(device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu"))
+        self.net = net.to(self.device)
+        self.density_mapper = density_mapper.to(self.device)
         self.gravity_forward = gravity_forward
         self.d_obs = d_obs.copy()
         self.guidance_schedule = guidance_schedule
@@ -122,6 +124,9 @@ class PosteriorFlowSolver:
 
         # Pre-computed mesh shape for numpy ↔ torch reshaping
         self._mesh_shape = gravity_forward.shape  # (nx, ny, nz)
+
+        # Updated each step as a side-effect of compute_likelihood_gradient
+        self._last_residual_norm: float = float("nan")
 
     # ------------------------------------------------------------------
     # Prior velocity
@@ -170,6 +175,7 @@ class PosteriorFlowSolver:
 
             d_pred = self.gravity_forward.forward(density_np)
             residual = d_pred - self.d_obs  # (n_data,)
+            self._last_residual_norm = float(np.linalg.norm(residual))
             grad_density_np = self.gravity_forward.jtvec(density_np, residual)
 
             # --- back to torch: chain-rule through soft-decode ------
@@ -248,7 +254,7 @@ class PosteriorFlowSolver:
         m_0: torch.Tensor,
         t0: float = 0.001,
         tf: float = 1.0,
-        n_steps: int = 50,
+        n_steps: int = 10,
         save_trajectory: bool = False,
     ) -> torch.Tensor:
         """Integrate the posterior ODE from *t0* to *tf*.
@@ -260,7 +266,8 @@ class PosteriorFlowSolver:
         t0, tf : float
             Start / end time.
         n_steps : int
-            Number of uniform time steps.
+            Number of uniform time steps. Default is 10 (light; use 50 for
+            production runs).
         save_trajectory : bool
             If *True* return ``(n_steps+1, B, E, X, Y, Z)``, otherwise just
             the final state ``(B, E, X, Y, Z)``.
@@ -274,13 +281,20 @@ class PosteriorFlowSolver:
 
         step_fn = self._step_rk4 if self.method == "rk4" else self._step_euler
 
-        if save_trajectory:
-            trajectory = [m_0.clone().cpu()]
+        m_t = m_0.to(self.device)
 
-        m_t = m_0.clone()
-        for i in tqdm(range(n_steps), desc="Posterior ODE"):
+        if save_trajectory:
+            trajectory = [m_t.clone().cpu()]
+        pbar = tqdm(range(n_steps), desc="Posterior ODE", unit="step")
+        for i in pbar:
             t = times[i].item()
             m_t = step_fn(m_t, t, dt)
+            # _last_residual_norm is set as a side-effect inside compute_likelihood_gradient
+            pbar.set_postfix(
+                t=f"{t:.3f}",
+                mu=f"{self.guidance_schedule(t):.3f}",
+                res=f"{self._last_residual_norm:.4g}",
+            )
             if save_trajectory:
                 trajectory.append(m_t.clone().cpu())
 

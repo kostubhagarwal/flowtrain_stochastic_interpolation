@@ -4,7 +4,6 @@ import torch
 import time
 import math
 import pyvista as pv
-from pyvistaqt import BackgroundPlotter
 import platform
 
 from boreholes import make_boreholes_mask, make_combined_mask, make_surface_mask
@@ -39,7 +38,7 @@ def get_config(args=None) -> dict:
         },
         # Data loader configurations
         "data": {
-            "shape": (64, 64, 64),  # [C, X, Y, Z]
+            "shape": (16, 16, 16),  # [C, X, Y, Z]
             "bounds": (
                 (-1920, 1920),
                 (-1920, 1920),
@@ -176,6 +175,8 @@ def run_inference(
     n_samples=10,
     inference_seed=None,
     save_imgs=True,
+    rtol=1e-6,
+    solver_method="dopri5",
 ) -> None:
     """
     Run inference using the ODEFlowSolver on the model.
@@ -201,8 +202,8 @@ def run_inference(
     def dxdt_cond(x, time, *args, **kwargs):
         return model.net.forward(x, ATb=ATb, time=time, *args, **kwargs)
 
-    # ODE solver (Adaptive step size)
-    solver = ODEFlowSolver(model=dxdt_cond, rtol=1e-6)
+    # ODE solver
+    solver = ODEFlowSolver(model=dxdt_cond, rtol=rtol, atol=rtol, method=solver_method)
 
     # Option for controlling the random seed for reproducibility
     generator = (
@@ -252,6 +253,8 @@ def populate_solutions(
     n_samples_each=9,
     batch_size=1,
     sample_title="run",
+    rtol=1e-3,
+    solver_method="dopri5",
 ):
     """
     Take a folder with conditional data and create a set of solutions.
@@ -305,6 +308,8 @@ def populate_solutions(
                 data_shape=model.data_shape,
                 n_samples=n_samples,
                 inference_seed=42 + i,
+                rtol=rtol,
+                solver_method=solver_method,
             )
 
             sol_tf = inv_solutions[-1]  # [B, C, X, Y, Z]
@@ -337,7 +342,7 @@ def show_model_and_boreholes(model, boreholes):
     Plot the model and boreholes side by side. Two 3D tensor inputs
     """
     # Make two pane pyvista plot
-    p = BackgroundPlotter(shape=(1, 2))
+    p = pv.Plotter(shape=(1, 2))
 
     # Plot the synthetic model
     p.subplot(0, 0)
@@ -386,7 +391,7 @@ def load_solutions(save_dir, sample_title="sol", device='cpu'):
 
 def load_model_with_ema_option(
     ckpt_path: str,
-    map_location: str = "cpu",
+    map_location: str = "cuda:0",
     use_ema: bool = False,
 ) -> Geo3DStochInterp:
     checkpoint = torch.load(ckpt_path, map_location=map_location)
@@ -522,6 +527,20 @@ def parse_arguments():
     )
     
     parser.add_argument(
+        '--rtol',
+        type=float,
+        default=1e-6,
+        help='ODE solver tolerance (use 1e-3 for fast laptop testing, 1e-6 for production quality)'
+    )
+
+    parser.add_argument(
+        '--solver',
+        choices=['dopri5', 'euler', 'midpoint', 'rk4'],
+        default='dopri5',
+        help='ODE solver method. Use "euler" for fast laptop testing (fixed steps, much faster on CPU)'
+    )
+
+    parser.add_argument(
         '--no-display',
         action='store_true',
         help='Skip displaying results (useful for headless systems)'
@@ -542,7 +561,7 @@ def main() -> None:
         inference_device = cfg["devices"]
     
     print(f"Running conditional inference on device: {inference_device}")
-    inference_device = 'cpu'
+    # inference_device = 'cpu'
 
     # Use provided checkpoint or default demo model
     if args.checkpoint_path:
@@ -584,6 +603,8 @@ def main() -> None:
         inference_method=run_inference,
         n_samples_each=args.n_samples,
         sample_title="sol",
+        rtol=args.rtol,
+        solver_method=args.solver,
     )
 
     print(f"Inference completed! Results saved to: {dirs['samples_dir']}")

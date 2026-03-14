@@ -32,10 +32,11 @@ class ODEFlowSolver:
 
     """
 
-    def __init__(self, model, atol=1e-6, rtol=1e-6):
+    def __init__(self, model, atol=1e-6, rtol=1e-6, method="dopri5"):
         self.model = model
         self.atol = atol
         self.rtol = rtol
+        self.method = method
 
     def solve(self, X0, frozen_mask=None, t0=0.0, tf=1.0, n_steps=32):
         """
@@ -74,7 +75,7 @@ class ODEFlowSolver:
                 return dxdt
 
         # Solve the ODE
-        return odeint(ode_func, X0, t, atol=self.atol, rtol=self.rtol, method="dopri5")
+        return odeint(ode_func, X0, t, atol=self.atol, rtol=self.rtol, method=self.method)
 
 
 class ODEOneSidedDenoisingSolver:
