@@ -1,0 +1,30 @@
+[project]
+name = "flowtrain"
+version = "1.0.0"
+description = "Generative AI for geogen data with stochastic interpolation"
+readme = "readme.md"
+requires-python = ">=3.12"
+dependencies = [
+    "scipy",
+    "denoising-diffusion-pytorch",
+    "torchdiffeq",
+    "numpy",
+    "torch",
+    "lightning",
+    "torchvision",
+    "einops",
+    "matplotlib",
+    "tqdm",
+    "seaborn",
+    "wandb",
+    "GeoGen @ git+https://github.com/eldadHaber/StructuralGeo.git@v1.0",
+    "simpeg",
+    "discretize",
+]
+
+[tool.uv.sources]
+flowtrain = { workspace = true }
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
