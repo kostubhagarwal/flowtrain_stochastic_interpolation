@@ -184,6 +184,8 @@ def get_config() -> dict:
             "temperature": 10.0,
             "grad_clip": None,
             "normalize_grad": False,
+            "air_mask_threshold": 0.0,
+            "air_z_frac": 0.0,
             "seed": 42,
         },
         "output": {
@@ -212,7 +214,7 @@ def create_synthetic_problem(
     shape = config["domain"]["shape"]
 
     print("Generating true model via unconditional sampling ...")
-    solver = ODEFlowSolver(model=model.net, rtol=1e-6)
+    solver = ODEFlowSolver(model=model.net, rtol=1e-5)
     X0 = torch.randn(1, model.embedding_dim, *shape, device=device)
     solution = solver.solve(X0, t0=0.001, tf=1.0, n_steps=32)
     X_final = solution[-1]  # (1, E, X, Y, Z)
@@ -241,11 +243,68 @@ def create_synthetic_problem(
 # Posterior sampling
 # ======================================================================
 
+def run_unconditional_sampling(
+    model: FlowModel,
+    config: dict,
+) -> list:
+    """Generate unconditional samples using the same seeds as posterior sampling.
+
+    These serve as a baseline — no gravity guidance, pure prior samples.
+    """
+    device = config["model"]["device"]
+    inv = config["inversion"]
+    shape = config["domain"]["shape"]
+
+    from tqdm import tqdm
+
+    n_steps = inv["n_steps"]
+    t0, tf  = inv["t0"], inv["tf"]
+    dt      = (tf - t0) / n_steps
+    times   = torch.linspace(t0, tf, n_steps + 1)
+    step_fn = inv["method"]  # "euler" or "rk4"
+
+    generator = torch.Generator(device="cpu").manual_seed(inv["seed"])
+    results = []
+
+    for idx in range(inv["n_samples"]):
+        print(f"\n--- Unconditional sample {idx + 1}/{inv['n_samples']} ---")
+        m_t = torch.randn(1, model.embedding_dim, *shape,
+                          generator=generator).to(device)
+
+        t_start = time.time()
+        pbar = tqdm(range(n_steps), desc="Unconditional ODE", unit="step")
+        for i in pbar:
+            t = times[i].item()
+            T = torch.full((m_t.size(0),), t, device=device)
+            with torch.no_grad():
+                if step_fn == "rk4":
+                    k1 = model.net(m_t, T)
+                    k2 = model.net(m_t + 0.5 * dt * k1,
+                                   torch.full_like(T, t + 0.5 * dt))
+                    k3 = model.net(m_t + 0.5 * dt * k2,
+                                   torch.full_like(T, t + 0.5 * dt))
+                    k4 = model.net(m_t + dt * k3,
+                                   torch.full_like(T, t + dt))
+                    v = (k1 + 2 * k2 + 2 * k3 + k4) / 6.0
+                else:
+                    v = model.net(m_t, T)
+            m_t = m_t + dt * v
+            pbar.set_postfix(t=f"{t:.3f}")
+
+        elapsed = time.time() - t_start
+        decoded = model.decode(m_t)[0].detach().cpu()
+        results.append(decoded)
+        print(f"  Completed in {elapsed:.1f}s")
+
+    return results
+
+
 def run_posterior_sampling(
     model: FlowModel,
     gravity_fwd: GravityForward,
     d_obs: np.ndarray,
     config: dict,
+    true_categorical: torch.Tensor = None,
 ) -> list:
     """Generate posterior samples conditioned on observed gravity data."""
     device = config["model"]["device"]
@@ -269,6 +328,9 @@ def run_posterior_sampling(
         method=inv["method"],
         grad_clip=inv["grad_clip"],
         normalize_grad=inv["normalize_grad"],
+        air_mask_threshold=inv["air_mask_threshold"],
+        air_z_frac=inv["air_z_frac"],
+        static_air_mask=(true_categorical == 0) if true_categorical is not None else None,
     )
 
     generator = torch.Generator(device="cpu").manual_seed(inv["seed"])
@@ -308,11 +370,12 @@ def run_posterior_sampling(
 
 def save_results(
     posterior_samples: list,
+    unconditional_samples: list,
     true_categorical: torch.Tensor,
     d_obs: np.ndarray,
     save_dir: str,
 ):
-    """Persist posterior samples, the true model, and observed data."""
+    """Persist posterior samples, unconditional samples, the true model, and observed data."""
     os.makedirs(save_dir, exist_ok=True)
 
     np.save(os.path.join(save_dir, "d_obs.npy"), d_obs)
@@ -320,6 +383,9 @@ def save_results(
 
     for i, sample in enumerate(posterior_samples):
         torch.save(sample, os.path.join(save_dir, f"posterior_sample_{i}.pt"))
+
+    for i, sample in enumerate(unconditional_samples):
+        torch.save(sample, os.path.join(save_dir, f"unconditional_sample_{i}.pt"))
 
     print(f"\nResults saved to {save_dir}")
 
@@ -355,6 +421,10 @@ def parse_arguments():
                         help="Gradient norm clipping value")
     parser.add_argument("--normalize-grad", action="store_true",
                         help="Normalise gradient to match prior velocity norm")
+    parser.add_argument("--air-mask-threshold", type=float, default=0.5,
+                        help="Zero gradient where air probability > threshold (0 to disable)")
+    parser.add_argument("--air-z-frac", type=float, default=0.0,
+                        help="Hard-mask top fraction of z-axis from gradient, e.g. 0.3")
     parser.add_argument("--noise-percent", type=float, default=2.0,
                         help="Noise level for synthetic data (%%)")
     parser.add_argument("--seed", type=int, default=42,
@@ -384,6 +454,8 @@ def main():
     config["inversion"]["method"] = args.method
     config["inversion"]["grad_clip"] = args.grad_clip
     config["inversion"]["normalize_grad"] = args.normalize_grad
+    config["inversion"]["air_mask_threshold"] = args.air_mask_threshold
+    config["inversion"]["air_z_frac"] = args.air_z_frac
     config["inversion"]["seed"] = args.seed
     config["gravity"]["noise_percent"] = args.noise_percent
     config["output"]["save_trajectory"] = args.save_trajectory
@@ -407,11 +479,15 @@ def main():
         model, gravity_fwd, config
     )
 
-    # 4. Run posterior sampling
-    posterior_samples = run_posterior_sampling(model, gravity_fwd, d_obs, config)
+    # 4. Run unconditional sampling (same seeds — baseline for comparison)
+    unconditional_samples = run_unconditional_sampling(model, config)
 
-    # 5. Save everything
-    save_results(posterior_samples, true_cat, d_obs, config["output"]["save_dir"])
+    # 5. Run posterior sampling
+    posterior_samples = run_posterior_sampling(model, gravity_fwd, d_obs, config, true_cat)
+
+    # 6. Save everything
+    save_results(posterior_samples, unconditional_samples, true_cat, d_obs,
+                 config["output"]["save_dir"])
 
 
 if __name__ == "__main__":

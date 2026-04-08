@@ -110,8 +110,21 @@ class PosteriorFlowSolver:
         method: str = "euler",
         grad_clip: Optional[float] = None,
         normalize_grad: bool = False,
+        air_mask_threshold: float = 0.5,
+        air_z_frac: float = 0.0,
+        static_air_mask: Optional[torch.Tensor] = None,
         device: Optional[Union[str, torch.device]] = None,
     ):
+        """
+        air_mask_threshold : float
+            Voxels where soft-decode p(air) > threshold have gradient zeroed.
+            Unreliable at early steps when probabilities are diffuse. Default 0.5.
+        air_z_frac : float
+            Fraction of the z-axis (top) to hard-mask. Default 0.0 (off).
+        static_air_mask : torch.Tensor or None
+            Boolean tensor (X, Y, Z) marking air voxels to exclude from guidance.
+            Copied from the true model in synthetic experiments. Guaranteed from t=0.
+        """
         self.device = torch.device(device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu"))
         self.net = net.to(self.device)
         self.density_mapper = density_mapper.to(self.device)
@@ -120,10 +133,22 @@ class PosteriorFlowSolver:
         self.guidance_schedule = guidance_schedule
         self.method = method
         self.grad_clip = grad_clip
+        self.air_mask_threshold = air_mask_threshold
         self.normalize_grad = normalize_grad
 
         # Pre-computed mesh shape for numpy ↔ torch reshaping
         self._mesh_shape = gravity_forward.shape  # (nx, ny, nz)
+
+        # Static z-mask: top air_z_frac of z-axis is always protected
+        nz = self._mesh_shape[2]
+        n_air = int(np.ceil(air_z_frac * nz))
+        self._z_air_slice = slice(nz - n_air, nz) if n_air > 0 else None
+
+        # Static voxel mask from true model: (1, 1, X, Y, Z) bool on device
+        if static_air_mask is not None:
+            self._static_air_mask = static_air_mask.bool().to(self.device).view(1, 1, *static_air_mask.shape[-3:])
+        else:
+            self._static_air_mask = None
 
         # Updated each step as a side-effect of compute_likelihood_gradient
         self._last_residual_norm: float = float("nan")
@@ -195,6 +220,24 @@ class PosteriorFlowSolver:
                 grad_outputs=grad_density_vol,
                 retain_graph=False,
             )[0]  # (1, E, X, Y, Z)
+
+            # Hard z-mask: zero gradient in the top air_z_frac of the volume.
+            if self._z_air_slice is not None:
+                grad_m[:, :, :, :, self._z_air_slice] = 0.0
+
+            # Static mask copied from true model: zero gradient at known air voxels.
+            if self._static_air_mask is not None:
+                grad_m = grad_m.masked_fill(self._static_air_mask, 0.0)
+
+            # Soft mask: zero gradient where soft-decode p(air) > threshold.
+            if self.air_mask_threshold > 0.0:
+                with torch.no_grad():
+                    probs = self.density_mapper.soft_decode_to_probabilities(
+                        m_t[b : b + 1]
+                    )  # (1, K, X, Y, Z)
+                    air_prob = probs[:, 0:1]  # category 0 = air
+                    air_mask = (air_prob > self.air_mask_threshold).float()
+                    grad_m = grad_m * (1.0 - air_mask)
 
             grads.append(grad_m.detach())
 
