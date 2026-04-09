@@ -8,7 +8,7 @@ from geogen.dataset import GeoData3DStreamingDataset
 from density_mapping import DifferentiableDensityMapper, DENSITY_TABLE_15
 from gravity_forward import GravityForward
 from boreholes import make_combined_mask
-from model_train_sh_inference_cond import Geo3DStochInterp
+from training.model_train_sh_inference_cond import Geo3DStochInterp
 from conditional_posterior_flow_solver import ConditionalPosteriorFlowSolver, GuidanceSchedule
 
 
@@ -73,14 +73,14 @@ def get_config() -> dict:
             "confidence":           0.95,
         },
         "inversion": {
-            "n_samples":      1,
+            "n_samples":      4,
             "n_steps":        50,
             "t0":             0.001,
             "tf":             1.0,
-            "mu_0":           10.0,
-            "schedule":       "linear_ramp",
+            "mu_0":           20.0,
+            "schedule":       "bell",
             "method":         "euler",
-            "temperature":    10.0,
+            "temperature":    5.0,
             "grad_clip":      None,
             "normalize_grad": False,
             "seed":           42,

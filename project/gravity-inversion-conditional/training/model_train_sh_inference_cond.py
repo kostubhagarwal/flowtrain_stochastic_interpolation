@@ -34,13 +34,13 @@ from lightning.pytorch.loggers import WandbLogger, CSVLogger
 
 # Project-specific imports
 from boreholes import make_boreholes_mask, make_surface_mask, make_combined_mask
-from callbacks import EMACallback, InferenceCallback
+from .callbacks import EMACallback, InferenceCallback
 from geogen.dataset import GeoData3DStreamingDataset
 from flowtrain.interpolation import LinearInterpolant, StochasticInterpolator
 from flowtrain.models import Unet3DCondV3 as Unet3D
 from flowtrain.solvers import ODEFlowSolver
 
-from utils import (
+from .utils import (
     find_latest_checkpoint,
     plot_cat_view,
     plot_static_views,

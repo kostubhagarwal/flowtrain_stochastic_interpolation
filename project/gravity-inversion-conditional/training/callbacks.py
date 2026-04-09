@@ -2,7 +2,7 @@ import os
 import time as clock
 
 import torch
-import utils
+from . import utils
 import wandb
 from lightning.pytorch.callbacks import Callback
 from lightning.pytorch.core import LightningModule
