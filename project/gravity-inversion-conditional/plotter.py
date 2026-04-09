@@ -12,6 +12,8 @@ RESULTS_DIR   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "result
 DENSITY_LUT   = np.array(DENSITY_TABLE_15, dtype=np.float32)
 CMAP          = "viridis"
 VMIN, VMAX    = 0.0, 3.8   # g/cm³ range of DENSITY_TABLE_15
+N_CATS        = 15          # categories 0–14 (0 = air)
+CAT_CMAP      = plt.cm.get_cmap("tab20", N_CATS)
 DPI           = 150
 
 
@@ -24,8 +26,8 @@ def load_results() -> Tuple[torch.Tensor, torch.Tensor, np.ndarray, List[torch.T
     prior_paths    = sorted(glob.glob(os.path.join(RESULTS_DIR, "conditional_prior_sample_*.pt")))
     post_paths     = sorted(glob.glob(os.path.join(RESULTS_DIR, "conditional_posterior_sample_*.pt")))
 
-    prior_samples     = [torch.load(prior_paths[-1],   map_location="cpu")] if prior_paths   else []
-    posterior_samples = [torch.load(post_paths[-1],    map_location="cpu")] if post_paths    else []
+    prior_samples     = [torch.load(p, map_location="cpu") for p in prior_paths]
+    posterior_samples = [torch.load(p, map_location="cpu") for p in post_paths]
 
     print(f"True model shape         : {true_model.shape}")
     print(f"Boreholes shape          : {boreholes.shape}")
@@ -54,20 +56,34 @@ def cat_to_density_flat(cat_vol: np.ndarray) -> np.ndarray:
     return DENSITY_LUT.astype(np.float64)[cat_vol.astype(int)].flatten(order="F")
 
 
+def _vol_to_slices(vol_np: np.ndarray, mode: str) -> Tuple[List[np.ndarray], object, float, float, str]:
+    """Return (3 mid-axis slices, cmap, vmin, vmax, colorbar_label) for the given mode."""
+    if mode == "categories":
+        data  = vol_np.astype(int)
+        cmap, vmin, vmax, label = CAT_CMAP, -0.5, N_CATS - 0.5, "Rock category"
+    else:
+        data  = cat_to_density(vol_np)
+        cmap, vmin, vmax, label = CMAP, VMIN, VMAX, "Density (g/cm³)"
+
+    mid    = data.shape[0] // 2
+    slices = [
+        data[:, :, mid],
+        np.rot90(data[:, mid, :], k=3),
+        np.rot90(data[mid, :, :], k=3),
+    ]
+    return slices, cmap, vmin, vmax, label
+
+
 def _obs_grid(d_obs: np.ndarray) -> np.ndarray:
     n_side = int(np.sqrt(d_obs.size))
     return d_obs.reshape(n_side, n_side) if n_side * n_side == d_obs.size else d_obs.reshape(-1, 1)
 
 
-def _show_3views(ax_row, vol_np: np.ndarray, title: str) -> None:
-    density_vol = cat_to_density(vol_np)
-    mid         = density_vol.shape[0] // 2
-    slices      = [density_vol[:, :, mid],
-                   np.rot90(density_vol[:, mid, :], k=3),
-                   np.rot90(density_vol[mid, :, :], k=3)]
-    labels      = ["XY (mid Z)", "XZ (mid Y)", "YZ (mid X)"]
+def _show_3views(ax_row, vol_np: np.ndarray, title: str, mode: str = "density") -> None:
+    slices, cmap, vmin, vmax, _ = _vol_to_slices(vol_np, mode)
+    labels = ["XY (mid Z)", "XZ (mid Y)", "YZ (mid X)"]
     for ax, slc, lbl in zip(ax_row, slices, labels):
-        ax.imshow(slc, cmap=CMAP, vmin=VMIN, vmax=VMAX, origin="lower", interpolation="nearest")
+        ax.imshow(slc, cmap=cmap, vmin=vmin, vmax=vmax, origin="lower", interpolation="nearest")
         ax.set_title(f"{title}\n{lbl}", fontsize=8)
         ax.axis("off")
 
@@ -77,30 +93,34 @@ def plot_trajectory(
     t0: float = 0.001,
     tf: float = 1.0,
     sample_idx: int = 0,
+    mode: str = "density",
 ) -> None:
     """Scrollable 3-slice view of an ODE trajectory.
 
     decoded_steps : list of (X, Y, Z) integer category arrays, one per time step.
+    mode          : 'density' or 'categories'
     Use the slider, or left/right arrow keys, to move through the integration.
     """
     from matplotlib.widgets import Slider
 
-    n_steps = len(decoded_steps)
-    times   = np.linspace(t0, tf, n_steps)
+    n_steps          = len(decoded_steps)
+    times            = np.linspace(t0, tf, n_steps)
+    _, cmap, vmin, vmax, cbar_label = _vol_to_slices(decoded_steps[0], mode)
 
     fig, axes = plt.subplots(1, 3, figsize=(11, 4))
     plt.subplots_adjust(bottom=0.22)
 
-    # Add a shared colorbar via a dummy ScalarMappable
-    sm = plt.cm.ScalarMappable(cmap=CMAP, norm=plt.Normalize(vmin=VMIN, vmax=VMAX))
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=vmin, vmax=vmax))
     sm.set_array([])
-    fig.colorbar(sm, ax=axes, label="Density (g/cm³)", fraction=0.015, pad=0.02)
+    cbar = fig.colorbar(sm, ax=axes, label=cbar_label, fraction=0.015, pad=0.02)
+    if mode == "categories":
+        cbar.set_ticks(np.arange(N_CATS))
 
     slice_imgs = []
-    labels = ["XY (mid Z)", "XZ (mid Y)", "YZ (mid X)"]
-    dummy = np.zeros((decoded_steps[0].shape[0], decoded_steps[0].shape[1]))
+    labels     = ["XY (mid Z)", "XZ (mid Y)", "YZ (mid X)"]
+    dummy      = np.zeros((decoded_steps[0].shape[0], decoded_steps[0].shape[1]))
     for ax, lbl in zip(axes, labels):
-        im = ax.imshow(dummy, cmap=CMAP, vmin=VMIN, vmax=VMAX,
+        im = ax.imshow(dummy, cmap=cmap, vmin=vmin, vmax=vmax,
                        origin="lower", interpolation="nearest")
         ax.set_title(lbl, fontsize=8)
         ax.axis("off")
@@ -109,28 +129,19 @@ def plot_trajectory(
     title = fig.suptitle("", fontsize=11)
 
     def draw(step: int) -> None:
-        vol         = decoded_steps[step]
-        density_vol = cat_to_density(vol)
-        mid         = density_vol.shape[0] // 2
-        slices      = [
-            density_vol[:, :, mid],
-            np.rot90(density_vol[:, mid, :], k=3),
-            np.rot90(density_vol[mid, :, :], k=3),
-        ]
+        slices, *_ = _vol_to_slices(decoded_steps[step], mode)
         for im, slc in zip(slice_imgs, slices):
             im.set_data(slc)
-        title.set_text(f"Conditional posterior sample {sample_idx} — step {step}/{n_steps - 1}  (t = {times[step]:.4f})")
+        title.set_text(
+            f"Conditional posterior sample {sample_idx} — step {step}/{n_steps - 1}  (t = {times[step]:.4f})"
+        )
         fig.canvas.draw_idle()
 
     draw(0)
 
     ax_slider = plt.axes([0.15, 0.08, 0.70, 0.04])
     slider    = Slider(ax_slider, "Step", 0, n_steps - 1, valinit=0, valstep=1)
-
-    def on_change(val: float) -> None:
-        draw(int(slider.val))
-
-    slider.on_changed(on_change)
+    slider.on_changed(lambda val: draw(int(val)))
 
     def on_key(event) -> None:
         step = int(slider.val)
@@ -148,23 +159,31 @@ def plot_geology_comparison(
     boreholes: torch.Tensor,
     prior_samples: List[torch.Tensor],
     posterior_samples: List[torch.Tensor],
+    mode: str = "density",
 ) -> None:
-    """XY / XZ / YZ density slices for the true model, boreholes, and all samples."""
+    """XY / XZ / YZ slices for the true model, boreholes, and all samples.
+
+    mode : 'density' or 'categories'
+    """
     rows  = [("True geology", true_model), ("Boreholes (observed)", boreholes)]
     rows += [(f"Cond. prior sample {i}",     s) for i, s in enumerate(prior_samples)]
     rows += [(f"Cond. posterior sample {i}", s) for i, s in enumerate(posterior_samples)]
 
-    n_rows      = len(rows)
-    fig, axes   = plt.subplots(n_rows, 3, figsize=(9, 3 * n_rows))
+    _, cmap, vmin, vmax, cbar_label = _vol_to_slices(squeeze(true_model), mode)
+
+    n_rows    = len(rows)
+    fig, axes = plt.subplots(n_rows, 3, figsize=(9, 3 * n_rows))
     if n_rows == 1:
         axes = axes[np.newaxis, :]
 
     for ax_row, (title, vol) in zip(axes, rows):
-        _show_3views(ax_row, squeeze(vol), title)
+        _show_3views(ax_row, squeeze(vol), title, mode=mode)
 
-    sm = plt.cm.ScalarMappable(cmap=CMAP, norm=mcolors.Normalize(vmin=VMIN, vmax=VMAX))
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=mcolors.Normalize(vmin=vmin, vmax=vmax))
     sm.set_array([])
-    fig.colorbar(sm, ax=axes, label="Density (g/cm³)", fraction=0.015, pad=0.02)
+    cbar = fig.colorbar(sm, ax=axes, label=cbar_label, fraction=0.015, pad=0.02)
+    if mode == "categories":
+        cbar.set_ticks(np.arange(N_CATS))
 
     plt.suptitle("Gravity inversion — conditional posterior flow sampling", fontsize=12, y=1.01)
     plt.tight_layout()
@@ -201,7 +220,7 @@ def plot_gravity_residuals(
     fig, axes = plt.subplots(1, n_cols, figsize=(4 * n_cols, 4))
 
     res_vals = np.concatenate([r for _, r in residual_rows])
-    vmax_res = np.percentile(np.abs(res_vals), 98)   # shared colour scale
+    vmax_res = np.percentile(np.abs(res_vals), 98)
 
     im0 = axes[0].imshow(_obs_grid(d_obs), cmap="RdBu_r", origin="lower")
     plt.colorbar(im0, ax=axes[0], label="gz (mGal)")
@@ -230,22 +249,29 @@ def save_trajectory_gif(
     tf: float = 1.0,
     sample_idx: int = 0,
     fps: int = 10,
+    mode: str = "density",
 ) -> None:
-    """Save an ODE trajectory as an animated GIF (3 density slices per frame)."""
+    """Save an ODE trajectory as an animated GIF (3 slices per frame).
+
+    mode : 'density' or 'categories'
+    """
     from matplotlib.animation import FuncAnimation, PillowWriter
 
-    n_steps = len(decoded_steps)
-    times   = np.linspace(t0, tf, n_steps)
+    n_steps          = len(decoded_steps)
+    times            = np.linspace(t0, tf, n_steps)
+    _, cmap, vmin, vmax, cbar_label = _vol_to_slices(decoded_steps[0], mode)
 
     fig, axes = plt.subplots(1, 3, figsize=(11, 4))
     plt.subplots_adjust(right=0.88)
-    sm = plt.cm.ScalarMappable(cmap=CMAP, norm=plt.Normalize(vmin=VMIN, vmax=VMAX))
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=vmin, vmax=vmax))
     sm.set_array([])
-    fig.colorbar(sm, ax=axes, label="Density (g/cm³)", fraction=0.015, pad=0.02)
+    cbar = fig.colorbar(sm, ax=axes, label=cbar_label, fraction=0.015, pad=0.02)
+    if mode == "categories":
+        cbar.set_ticks(np.arange(N_CATS))
 
     labels = ["XY (mid Z)", "XZ (mid Y)", "YZ (mid X)"]
     dummy  = np.zeros((decoded_steps[0].shape[0], decoded_steps[0].shape[1]))
-    imgs   = [ax.imshow(dummy, cmap=CMAP, vmin=VMIN, vmax=VMAX,
+    imgs   = [ax.imshow(dummy, cmap=cmap, vmin=vmin, vmax=vmax,
                         origin="lower", interpolation="nearest")
               for ax in axes]
     for ax, lbl in zip(axes, labels):
@@ -254,15 +280,12 @@ def save_trajectory_gif(
     title = fig.suptitle("", fontsize=11)
 
     def update(step: int):
-        vol         = decoded_steps[step]
-        density_vol = cat_to_density(vol)
-        mid         = density_vol.shape[0] // 2
-        slices      = [density_vol[:, :, mid],
-                       np.rot90(density_vol[:, mid, :], k=3),
-                       np.rot90(density_vol[mid, :, :], k=3)]
+        slices, *_ = _vol_to_slices(decoded_steps[step], mode)
         for im, slc in zip(imgs, slices):
             im.set_data(slc)
-        title.set_text(f"Conditional posterior sample {sample_idx} — step {step}/{n_steps - 1}  (t = {times[step]:.4f})")
+        title.set_text(
+            f"Conditional posterior sample {sample_idx} — step {step}/{n_steps - 1}  (t = {times[step]:.4f})"
+        )
         return imgs
 
     anim = FuncAnimation(fig, update, frames=n_steps, interval=1000 // fps, blit=False)
@@ -272,22 +295,30 @@ def save_trajectory_gif(
 
 
 if __name__ == "__main__":
+
+    MODE          = "categories"   # "density" | "categories"
+    PLOT_GRAVITY  = True
+    GIF_FPS       = 10
+    
     from gravity_forward import GravityForward
 
     true_model, boreholes, d_obs, prior_samples, posterior_samples = load_results()
-    plot_geology_comparison(true_model, boreholes, prior_samples, posterior_samples)
+
+    plot_geology_comparison(true_model, boreholes, prior_samples, posterior_samples, mode=MODE)
 
     traj_paths = sorted(glob.glob(os.path.join(RESULTS_DIR, "trajectory_*.pt")))
     for traj_path in traj_paths:
-        idx = int(os.path.splitext(os.path.basename(traj_path))[0].split("_")[-1])
+        idx           = int(os.path.splitext(os.path.basename(traj_path))[0].split("_")[-1])
         decoded_steps = [t.numpy() for t in torch.load(traj_path, map_location="cpu")]
-        out_path = os.path.join(RESULTS_DIR, f"trajectory_{idx}.gif")
-        save_trajectory_gif(decoded_steps, out_path, sample_idx=idx)
+        out_path      = os.path.join(RESULTS_DIR, f"trajectory_{idx}_{MODE}.gif")
+        save_trajectory_gif(decoded_steps, out_path, sample_idx=idx, fps=GIF_FPS, mode=MODE)
 
-    print("\nBuilding gravity forward operator ...")
-    gravity_fwd = GravityForward(shape=(64, 64, 64),
-                                 bounds=((-1920, 1920), (-1920, 1920), (-1920, 1920)),
-                                 n_receivers_per_side=32,
-                                 receiver_height=30.0)
-    plot_gravity_residuals(d_obs, true_model, prior_samples, posterior_samples, gravity_fwd)
+    if PLOT_GRAVITY:
+        print("\nBuilding gravity forward operator ...")
+        gravity_fwd = GravityForward(shape=(64, 64, 64),
+                                     bounds=((-1920, 1920), (-1920, 1920), (-1920, 1920)),
+                                     n_receivers_per_side=32,
+                                     receiver_height=30.0)
+        plot_gravity_residuals(d_obs, true_model, prior_samples, posterior_samples, gravity_fwd)
+
     print(f"\nFigures saved to {RESULTS_DIR}")
