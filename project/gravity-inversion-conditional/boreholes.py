@@ -42,33 +42,40 @@ def _jittered_grid_points(X, Y, n_bores, device="cpu"):
     return points_tensor
 
 
-def make_boreholes_mask(X: torch.Tensor) -> torch.Tensor:
+def make_boreholes_mask(X: torch.Tensor, n_bores_min: int = 8, n_bores_max: int = 16) -> torch.Tensor:
     """
-    Create a boolean mask of shape (B, 1, X, Y, Z) with 'vertical boreholes'.
+    Create a boolean mask of shape (B, 1, X, Y, Z) with borehole observations.
 
     For each batch item:
-      1) Randomly choose n_bores between 8 and 64
+      1) Randomly choose n_bores in [n_bores_min, n_bores_max)
       2) Generate jittered 2D points in the (X, Y) plane
-      3) Mark the entire Z-depth at those (x, y) positions as True
+      3) At each (x, y) location mark from the rock surface (topmost non-air
+         voxel) down to z=0 (bottom of domain).
 
     Arguments:
-      X: a tensor of shape (B, C, size_x, size_y, size_z)
+      X:           a tensor of shape (B, C, size_x, size_y, size_z)
+      n_bores_min: minimum number of boreholes (inclusive)
+      n_bores_max: maximum number of boreholes (exclusive)
 
     Returns:
       mask: a bool tensor of shape (B, 1, size_x, size_y, size_z)
-            with True in the borehole positions, False elsewhere.
     """
     B, C, size_x, size_y, size_z = X.shape
     device = X.device
     mask = torch.zeros((B, 1, size_x, size_y, size_z), dtype=torch.bool, device=device)
 
     for b in range(B):
-        n_bores = torch.randint(8, 32, (1,), device=device).item()
+        n_bores = torch.randint(n_bores_min, n_bores_max, (1,), device=device).item()
         coords_2d = _jittered_grid_points(size_x, size_y, n_bores, device=device)
 
-        x_coords = coords_2d[:, 0]
-        y_coords = coords_2d[:, 1]
-        mask[b, 0, x_coords, y_coords, :] = True
+        for x, y in coords_2d:
+            col = X[b, 0, x, y, :]          # (size_z,)
+            rock_mask = col != -1            # True where rock (non-air)
+            if rock_mask.any():
+                # highest z-index that is rock = the surface at this (x, y)
+                surface_z = rock_mask.nonzero(as_tuple=False)[-1].item()
+                # mark from surface down to z=0 (bottom of domain)
+                mask[b, 0, x, y, :surface_z + 1] = True
 
     return mask
 
@@ -108,18 +115,20 @@ def make_surface_mask(X: torch.Tensor) -> torch.Tensor:
     return mask
 
 
-def make_combined_mask(X: torch.Tensor) -> torch.Tensor:
+def make_combined_mask(X: torch.Tensor, n_bores_min: int = 8, n_bores_max: int = 16) -> torch.Tensor:
     """
     Combines the borehole and surface masks into a single boolean mask.
 
     Arguments:
-        X: a tensor of shape (B, C, size_x, size_y, size_z)
+        X:           a tensor of shape (B, C, size_x, size_y, size_z)
+        n_bores_min: minimum number of boreholes (inclusive)
+        n_bores_max: maximum number of boreholes (exclusive)
 
     Returns:
         combined_mask: a bool tensor of shape (B, 1, size_x, size_y, size_z)
                        with True for both boreholes and surface features.
     """
-    borehole_mask = make_boreholes_mask(X)
+    borehole_mask = make_boreholes_mask(X, n_bores_min=n_bores_min, n_bores_max=n_bores_max)
     surface_mask = make_surface_mask(X)
     combined_mask = borehole_mask | surface_mask
 

@@ -62,6 +62,10 @@ def get_config() -> dict:
             "shape":  (64, 64, 64),
             "bounds": ((-1920, 1920), (-1920, 1920), (-1920, 1920)),
         },
+        "boreholes": {
+            "n_bores_min": 8,
+            "n_bores_max": 16,
+        },
         "gravity": {
             "n_receivers_per_side": 32,
             "receiver_height":      30.0,
@@ -73,7 +77,7 @@ def get_config() -> dict:
             "n_steps":        50,
             "t0":             0.001,
             "tf":             1.0,
-            "mu_0":           5.0,
+            "mu_0":           10.0,
             "schedule":       "linear_ramp",
             "method":         "euler",
             "temperature":    10.0,
@@ -107,7 +111,11 @@ def create_synthetic_problem(
     raw_data = dataset[0].unsqueeze(0).to(device)
 
     # borehole mask: observed voxels keep their category, unobserved → -1 (air sentinel)
-    boreholes_mask = make_combined_mask(raw_data)   # (1, 1, X, Y, Z) bool
+    boreholes_mask = make_combined_mask(
+        raw_data,
+        n_bores_min=config["boreholes"]["n_bores_min"],
+        n_bores_max=config["boreholes"]["n_bores_max"],
+    )   # (1, 1, X, Y, Z) bool
     boreholes      = raw_data.clone()
     boreholes[~boreholes_mask] = -1
 
@@ -135,7 +143,7 @@ def create_synthetic_problem(
     print(f"  Borehole voxels: {boreholes_mask.sum().item()} / {boreholes_mask.numel()}")
     print(f"  Density:         {true_density_np.min():.2f} – {true_density_np.max():.2f} g/cm³")
     print(f"  Gravity:         {d_obs.shape[0]} obs, range {d_obs.min():.4f} – {d_obs.max():.4f}")
-    return true_categorical, boreholes_cat, atb, d_obs
+    return true_categorical, boreholes_cat, atb, d_obs, boreholes_mask
 
 
 def run_conditional_prior_sampling(
@@ -192,6 +200,7 @@ def run_conditional_posterior_sampling(
     d_obs: np.ndarray,
     config: dict,
     true_categorical: torch.Tensor = None,
+    boreholes_mask: torch.Tensor = None,
 ) -> list:
     device = config["model"]["device"]
     inv    = config["inversion"]
@@ -214,6 +223,7 @@ def run_conditional_posterior_sampling(
         normalize_grad=inv["normalize_grad"],
         static_air_mask=(true_categorical == 0) if true_categorical is not None else None,
         atb=atb,
+        borehole_mask=boreholes_mask,
     )
 
     generator    = torch.Generator(device="cpu").manual_seed(inv["seed"])
@@ -283,10 +293,10 @@ def main():
     print(f"  Mesh cells: {gravity_fwd.mesh.nC}")
     print(f"  Receivers : {gravity_fwd.survey.nD}")
 
-    true_cat, boreholes_cat, atb, d_obs = create_synthetic_problem(model, gravity_fwd, config)
+    true_cat, boreholes_cat, atb, d_obs, boreholes_mask = create_synthetic_problem(model, gravity_fwd, config)
     prior_samples     = run_conditional_prior_sampling(model, atb, config)
     posterior_samples, trajectories = run_conditional_posterior_sampling(
-        model, atb, gravity_fwd, d_obs, config, true_cat
+        model, atb, gravity_fwd, d_obs, config, true_cat, boreholes_mask
     )
     save_results(posterior_samples, prior_samples, true_cat, boreholes_cat, d_obs,
                  config["output"]["save_dir"], trajectories)

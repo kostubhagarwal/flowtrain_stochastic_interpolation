@@ -38,6 +38,7 @@ class ConditionalPosteriorFlowSolver(PosteriorFlowSolver):
         static_air_mask: Optional[torch.Tensor] = None,
         device: Optional[Union[str, torch.device]] = None,
         atb: Optional[torch.Tensor] = None,
+        borehole_mask: Optional[torch.Tensor] = None,
     ):
         super().__init__(
             net=net,
@@ -53,6 +54,9 @@ class ConditionalPosteriorFlowSolver(PosteriorFlowSolver):
         )
         # borehole conditioning kept on the solver's device, broadcast to batch at call time
         self.atb = atb.to(self.device) if atb is not None else None
+        # exclude borehole-observed voxels from gravity gradient — prior owns those
+        if borehole_mask is not None:
+            self._borehole_mask = borehole_mask.bool().to(self.device).view(1, 1, *borehole_mask.shape[-3:])
 
     def compute_prior(self, m_t: torch.Tensor, t: float) -> torch.Tensor:
         """Conditional prior velocity: net(m_t, ATb, t) instead of net(m_t, t)."""

@@ -78,6 +78,7 @@ class PosteriorFlowSolver:
             static_air_mask.bool().to(self.device).view(1, 1, *static_air_mask.shape[-3:])
             if static_air_mask is not None else None
         )
+        self._borehole_mask = None  # set by subclass if needed
 
         self._last_residual_norm: float = float("nan")
 
@@ -119,6 +120,8 @@ class PosteriorFlowSolver:
 
             if self._static_air_mask is not None:
                 grad_m = grad_m.masked_fill(self._static_air_mask, 0.0)
+            if self._borehole_mask is not None:
+                grad_m = grad_m.masked_fill(self._borehole_mask, 0.0)
 
             grads.append(grad_m.detach())
 
