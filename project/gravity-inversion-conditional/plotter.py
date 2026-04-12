@@ -16,6 +16,16 @@ N_CATS        = 15          # categories 0–14 (0 = air)
 CAT_CMAP      = plt.cm.get_cmap("tab20", N_CATS)
 DPI           = 150
 
+# Geological rock-type groups: name → (list of category indices, matplotlib color)
+ROCK_GROUPS = {
+    "air":       ([0],          "#aec6cf"),
+    "bedrock":   ([1],          "#8B4513"),
+    "sediment":  ([2, 3, 4, 5, 6], "#d4a96a"),
+    "dike":      ([7, 8, 9],    "#6a5acd"),
+    "intrusion": ([10, 11, 12], "#e05c5c"),
+    "ore":       ([13, 14],     "#ffd700"),
+}
+
 
 def load_results() -> Tuple[torch.Tensor, torch.Tensor, np.ndarray, List[torch.Tensor], List[torch.Tensor]]:
     """Load true model, boreholes, observed gravity, and the latest conditional prior / posterior samples."""
@@ -294,6 +304,265 @@ def save_trajectory_gif(
     print(f"  Saved {out_path}")
 
 
+def compute_category_probabilities(samples: List[torch.Tensor]) -> np.ndarray:
+    """Stack N samples and compute per-voxel category probabilities.
+
+    Returns
+    -------
+    probs : (15, X, Y, Z) float32 array in [0, 1], where probs[k] is the
+            fraction of samples that assigned category k to each voxel.
+    """
+    stacked = np.stack([squeeze(s).astype(int) for s in samples], axis=0)  # (N, X, Y, Z)
+    N, X, Y, Z = stacked.shape
+    probs = np.zeros((N_CATS, X, Y, Z), dtype=np.float32)
+    for k in range(N_CATS):
+        probs[k] = (stacked == k).sum(axis=0) / N
+    return probs
+
+
+def plot_category_probability(
+    samples: List[torch.Tensor],
+    skip_air: bool = True,
+) -> None:
+    """One row per category, 3 orthogonal slices, opacity = P(category | data).
+
+    More opaque where all samples agree it's that category, transparent where they don't.
+    """
+    probs = compute_category_probabilities(samples)   # (15, X, Y, Z)
+
+    cat_range = range(1, N_CATS) if skip_air else range(N_CATS)
+    n_rows    = len(list(cat_range))
+
+    fig, axes = plt.subplots(n_rows, 3, figsize=(10, 2.8 * n_rows))
+    if n_rows == 1:
+        axes = axes[np.newaxis, :]
+
+    slice_labels = ["XY (mid Z)", "XZ (mid Y)", "YZ (mid X)"]
+
+    for row_ax, k in zip(axes, cat_range):
+        prob = probs[k]   # (X, Y, Z)
+        color = CAT_CMAP(k)[:3]
+
+        mid = prob.shape[0] // 2
+        slices = [
+            prob[:, :, mid],
+            np.rot90(prob[:, mid, :], k=3),
+            np.rot90(prob[mid, :, :], k=3),
+        ]
+
+        for ax, slc, lbl in zip(row_ax, slices, slice_labels):
+            rgba = np.zeros((*slc.shape, 4), dtype=np.float32)
+            rgba[..., :3] = color
+            rgba[..., 3]  = slc
+            ax.set_facecolor("white")
+            ax.imshow(np.ones((*slc.shape, 3)), origin="lower", interpolation="nearest")
+            ax.imshow(rgba, origin="lower", interpolation="nearest")
+            ax.set_title(lbl, fontsize=7)
+            ax.axis("off")
+
+        density   = DENSITY_LUT[k]
+        rock_name = next(
+            name for name, (cats, _) in ROCK_GROUPS.items() if k in cats
+        )
+        row_ax[0].set_ylabel(f"cat {k} — {rock_name}\n({density:.2f} g/cm³)", fontsize=8, labelpad=4)
+
+        cmap_row = mcolors.LinearSegmentedColormap.from_list(
+            f"cat{k}", [(1, 1, 1, 0), (*color, 1)]
+        )
+        sm = plt.cm.ScalarMappable(cmap=cmap_row, norm=plt.Normalize(0, 1))
+        sm.set_array([])
+        cbar = fig.colorbar(sm, ax=row_ax, fraction=0.015, pad=0.01)
+        cbar.set_ticks([0, 0.5, 1.0])
+
+    plt.suptitle(
+        f"Per-category probability  (N={len(samples)} samples)",
+        fontsize=12, y=1.005
+    )
+    plt.tight_layout()
+    out_path = os.path.join(RESULTS_DIR, "category_probability.png")
+    plt.savefig(out_path, dpi=DPI, bbox_inches="tight")
+    plt.show()
+    print(f"  Saved {out_path}")
+
+
+def plot_rock_type_probability(
+    samples: List[torch.Tensor],
+    groups: dict = None,
+    title_prefix: str = "",
+    axis: int = 2,
+) -> None:
+    """For each geological group, plot 3 orthogonal probability slices.
+
+    The colour intensity (and alpha) of each voxel encodes the fraction of
+    ensemble samples that predicted that rock type — darker/more opaque means
+    higher probability.
+
+    Parameters
+    ----------
+    samples     : list of (X, Y, Z) integer category tensors (posterior samples)
+    groups      : dict of {name: (cat_indices, color)}, defaults to ROCK_GROUPS
+    title_prefix: prepended to the figure super-title
+    axis        : which axis to use for the mid-slice (0, 1, or 2)
+    """
+    if groups is None:
+        groups = ROCK_GROUPS
+
+    probs      = compute_category_probabilities(samples)   # (15, X, Y, Z)
+    group_names = [k for k in groups if k != "air"]        # skip air for readability
+    n_groups   = len(group_names)
+    slice_labels = ["XY (mid Z)", "XZ (mid Y)", "YZ (mid X)"]
+
+    fig, axes = plt.subplots(n_groups, 3, figsize=(10, 3.2 * n_groups))
+    if n_groups == 1:
+        axes = axes[np.newaxis, :]
+
+    for row_ax, name in zip(axes, group_names):
+        cat_indices, color = groups[name]
+        # Aggregate probability across all categories in this group
+        group_prob = probs[cat_indices].sum(axis=0)   # (X, Y, Z) in [0, 1]
+
+        mid = group_prob.shape[0] // 2
+        slices = [
+            group_prob[:, :, mid],
+            np.rot90(group_prob[:, mid, :], k=3),
+            np.rot90(group_prob[mid, :, :], k=3),
+        ]
+
+        for ax, slc, lbl in zip(row_ax, slices, slice_labels):
+            # Build an RGBA image: fixed hue from group color, alpha = probability
+            rgb = mcolors.to_rgb(color)
+            rgba = np.zeros((*slc.shape, 4), dtype=np.float32)
+            rgba[..., :3] = rgb
+            rgba[..., 3]  = slc           # alpha encodes P(rock type | data)
+
+            # White background so transparent areas look empty
+            ax.set_facecolor("white")
+            ax.imshow(np.ones((*slc.shape, 3)), origin="lower", interpolation="nearest")
+            ax.imshow(rgba, origin="lower", interpolation="nearest")
+
+            ax.set_title(lbl, fontsize=7)
+            ax.axis("off")
+
+        row_ax[0].set_ylabel(name, fontsize=10, labelpad=6)
+
+        # Colorbar for this row using a single-hue LinearSegmentedColormap
+        cmap_row = mcolors.LinearSegmentedColormap.from_list(
+            name, [(1, 1, 1, 0), (*mcolors.to_rgb(color), 1)]
+        )
+        sm = plt.cm.ScalarMappable(cmap=cmap_row, norm=plt.Normalize(0, 1))
+        sm.set_array([])
+        cbar = fig.colorbar(sm, ax=row_ax, fraction=0.015, pad=0.01)
+        cbar.set_label(f"P({name})", fontsize=8)
+        cbar.set_ticks([0, 0.25, 0.5, 0.75, 1.0])
+
+    suptitle = f"{title_prefix} Rock-type probability  (N={len(samples)} samples)"
+    plt.suptitle(suptitle.strip(), fontsize=12, y=1.01)
+    plt.tight_layout()
+    out_path = os.path.join(RESULTS_DIR, "rock_type_probability.png")
+    plt.savefig(out_path, dpi=DPI, bbox_inches="tight")
+    plt.show()
+    print(f"  Saved {out_path}")
+
+
+def plot_ensemble_uncertainty(
+    samples: List[torch.Tensor],
+    title_prefix: str = "",
+) -> None:
+    """Per-voxel Shannon entropy of the ensemble category distribution.
+
+    High entropy → samples disagree about what's there.
+    Low entropy  → all samples agree.
+    """
+    probs = compute_category_probabilities(samples)   # (15, X, Y, Z)
+
+    # Shannon entropy H = -sum p log p  (bits, base 2)
+    eps     = 1e-10
+    entropy = -(probs * np.log2(probs + eps)).sum(axis=0)   # (X, Y, Z)
+    max_ent = np.log2(N_CATS)
+
+    mid = entropy.shape[0] // 2
+    slices = [
+        entropy[:, :, mid],
+        np.rot90(entropy[:, mid, :], k=3),
+        np.rot90(entropy[mid, :, :], k=3),
+    ]
+    labels = ["XY (mid Z)", "XZ (mid Y)", "YZ (mid X)"]
+
+    fig, axes = plt.subplots(1, 3, figsize=(11, 4))
+    for ax, slc, lbl in zip(axes, slices, labels):
+        im = ax.imshow(slc, cmap="inferno_r", vmin=0, vmax=max_ent,
+                       origin="lower", interpolation="nearest")
+        ax.set_title(lbl, fontsize=9)
+        ax.axis("off")
+
+    sm = plt.cm.ScalarMappable(cmap="inferno_r", norm=plt.Normalize(0, max_ent))
+    sm.set_array([])
+    fig.colorbar(sm, ax=axes, label="Entropy (bits)", fraction=0.015, pad=0.02)
+
+    suptitle = f"{title_prefix} Ensemble uncertainty  (N={len(samples)} samples)"
+    plt.suptitle(suptitle.strip(), fontsize=12)
+    plt.tight_layout()
+    out_path = os.path.join(RESULTS_DIR, "ensemble_uncertainty.png")
+    plt.savefig(out_path, dpi=DPI, bbox_inches="tight")
+    plt.show()
+    print(f"  Saved {out_path}")
+
+
+def plot_feature_extent(
+    samples: List[torch.Tensor],
+    threshold: float = 0.5,
+    groups: dict = None,
+) -> None:
+    """Binary 3-slice view of where each rock type is likely (P > threshold).
+
+    Shows volume fraction of the subsurface exceeding the threshold for each group.
+    """
+    if groups is None:
+        groups = ROCK_GROUPS
+
+    probs      = compute_category_probabilities(samples)
+    group_names = [k for k in groups if k != "air"]
+    n_groups   = len(group_names)
+
+    fig, axes = plt.subplots(n_groups, 3, figsize=(10, 3.2 * n_groups))
+    if n_groups == 1:
+        axes = axes[np.newaxis, :]
+
+    slice_labels = ["XY (mid Z)", "XZ (mid Y)", "YZ (mid X)"]
+
+    for row_ax, name in zip(axes, group_names):
+        cat_indices, color = groups[name]
+        group_prob = probs[cat_indices].sum(axis=0)
+        mask       = (group_prob >= threshold).astype(float)
+        vol_frac   = mask.mean() * 100
+
+        mid = mask.shape[0] // 2
+        slices = [
+            mask[:, :, mid],
+            np.rot90(mask[:, mid, :], k=3),
+            np.rot90(mask[mid, :, :], k=3),
+        ]
+
+        cmap_bin = mcolors.ListedColormap(["white", color])
+        for ax, slc, lbl in zip(row_ax, slices, slice_labels):
+            ax.imshow(slc, cmap=cmap_bin, vmin=0, vmax=1,
+                      origin="lower", interpolation="nearest")
+            ax.set_title(lbl, fontsize=7)
+            ax.axis("off")
+
+        row_ax[0].set_ylabel(f"{name}\n({vol_frac:.1f}% of volume)", fontsize=9, labelpad=6)
+
+    plt.suptitle(
+        f"Feature extent  (P ≥ {threshold:.0%},  N={len(samples)} samples)",
+        fontsize=12, y=1.01
+    )
+    plt.tight_layout()
+    out_path = os.path.join(RESULTS_DIR, "feature_extent.png")
+    plt.savefig(out_path, dpi=DPI, bbox_inches="tight")
+    plt.show()
+    print(f"  Saved {out_path}")
+
+
 if __name__ == "__main__":
 
     MODE          = "categories"   # "density" | "categories"
@@ -305,6 +574,11 @@ if __name__ == "__main__":
     true_model, boreholes, d_obs, prior_samples, posterior_samples = load_results()
 
     plot_geology_comparison(true_model, boreholes, prior_samples, posterior_samples, mode=MODE)
+
+    if posterior_samples:
+        plot_category_probability(posterior_samples)
+        plot_rock_type_probability(posterior_samples, title_prefix="Posterior")
+        plot_ensemble_uncertainty(posterior_samples, title_prefix="Posterior")
 
     traj_paths = sorted(glob.glob(os.path.join(RESULTS_DIR, "trajectory_*.pt")))
     for traj_path in traj_paths:

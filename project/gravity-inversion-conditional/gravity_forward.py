@@ -29,11 +29,13 @@ class GravityForward:
         ),
         n_receivers_per_side: int = 16,
         receiver_height: float = 30.0,
+        reference_density: float = 2.67,  # g/cm³ — subtracted before forward to remove DC edge signal
     ):
         self.shape = shape
         self.bounds = bounds
         self.n_receivers_per_side = n_receivers_per_side
         self.receiver_height = receiver_height
+        self.reference_density = reference_density
 
         self.mesh       = self._build_mesh()
         self.survey     = self._build_survey()
@@ -70,12 +72,12 @@ class GravityForward:
         )
 
     def forward(self, density: np.ndarray) -> np.ndarray:
-        # Forward mapping 2D gravity signal from 3D density voxel map 
-        return self.simulation.dpred(density)
+        # Forward on density anomaly δρ = ρ - ρ_ref to suppress the DC edge signal
+        return self.simulation.dpred(density - self.reference_density)
 
     def jtvec(self, density: np.ndarray, v: np.ndarray) -> np.ndarray:
-        # How does changing this voxel contribute to the residuals measured where v is typically (d_pred - d_obs).
-        return self.simulation.Jtvec(density, v)
+        # Jacobian transpose is linear so reference cancels — pass anomaly for consistency
+        return self.simulation.Jtvec(density - self.reference_density, v)
 
     def generate_synthetic_data(
         self,

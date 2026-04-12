@@ -1,14 +1,10 @@
-""" Boreholing module for 3D conditional simulation. """
-
-import torch
-
 import torch
 import math
 
 
 def _jittered_grid_points(X, Y, n_bores, device="cpu"):
     """
-    Generate 'jittered grid' 2D points (x, y) within a X-by-Y area.
+    Synthetically generate boreholes.
     Returns a LongTensor of shape (n_points, 2).
     """
     # Number of cells in x/y to approximate n_bores
@@ -24,7 +20,7 @@ def _jittered_grid_points(X, Y, n_bores, device="cpu"):
         for j in range(n_y):
             center_x = (i + 0.5) * cell_width_x
             center_y = (j + 0.5) * cell_width_y
-            # Jitter around the cell center
+
             rand_x = torch.rand(1, device=device) * cell_width_x - cell_width_x / 2
             rand_y = torch.rand(1, device=device) * cell_width_y - cell_width_y / 2
 

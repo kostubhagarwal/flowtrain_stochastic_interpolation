@@ -88,6 +88,7 @@ def get_config() -> dict:
         "output": {
             "save_dir":        os.path.join(_SCRIPT_DIR, "results"),
             "save_trajectory": True,
+            "mode":            "density",   # "density" | "categories"
         },
     }
 
@@ -305,7 +306,7 @@ def main():
         from plotter import plot_trajectory
         for idx, traj in enumerate(trajectories):
             plot_trajectory(traj, t0=config["inversion"]["t0"], tf=config["inversion"]["tf"],
-                            sample_idx=idx)
+                            sample_idx=idx, mode=config["output"]["mode"])
 
 
 if __name__ == "__main__":
